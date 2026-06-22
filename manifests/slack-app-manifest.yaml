@@ -7,8 +7,10 @@ features:
     display_name: coding-agent
     always_online: true
   assistant_view:
-    assistant_label: Coding Agent
     assistant_description: Sends your Slack prompts to your local coding agent.
+    suggested_prompts:
+      - title: Ask the coding agent
+        message: Help me with the current coding task.
 oauth_config:
   scopes:
     bot:
