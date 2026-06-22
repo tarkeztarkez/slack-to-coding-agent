@@ -6,6 +6,7 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+import httpx
 from slack_bolt import App, Assistant
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk import WebClient
@@ -16,6 +17,31 @@ from .process import ensure_backend_started
 
 LOGGER = logging.getLogger(__name__)
 MAX_SLACK_CHUNK = 3500
+MAX_THREAD_MESSAGES = 40
+MAX_ATTACHMENT_BYTES = 50_000
+TEXT_FILETYPES = {
+    "c",
+    "cpp",
+    "css",
+    "csv",
+    "go",
+    "html",
+    "java",
+    "javascript",
+    "json",
+    "kotlin",
+    "markdown",
+    "php",
+    "plaintext",
+    "python",
+    "ruby",
+    "rust",
+    "shell",
+    "swift",
+    "typescript",
+    "xml",
+    "yaml",
+}
 
 
 def run(config: AppConfig) -> None:
@@ -50,7 +76,12 @@ def run(config: AppConfig) -> None:
         say: Callable[..., Any],
         set_status: Callable[..., Any] | None = None,
     ):
-        bridge.handle_assistant_user_message(payload=payload, say=say, set_status=set_status)
+        bridge.handle_assistant_user_message(
+            payload=payload,
+            say=say,
+            set_status=set_status,
+            client=app.client,
+        )
 
     app.use(assistant)
 
@@ -112,6 +143,8 @@ class SlackBridge:
             user_id=user_id,
             channel_id=channel_id,
             thread_ts=thread_ts,
+            thread_messages=[],
+            attachments=[],
         )
 
         self._run_in_background(
@@ -120,6 +153,7 @@ class SlackBridge:
                 request=request,
                 channel_id=channel_id,
                 reply_thread_ts=thread_ts or event_ts,
+                fallback_event=event,
             )
         )
 
@@ -156,6 +190,7 @@ class SlackBridge:
         payload: dict[str, Any],
         say: Callable[..., Any],
         set_status: Callable[..., Any] | None,
+        client: WebClient,
     ) -> None:
         user_id = str(payload.get("user") or "")
         if not self._is_allowed_user(user_id):
@@ -175,6 +210,13 @@ class SlackBridge:
             user_id=user_id,
             channel_id=channel_id,
             thread_ts=thread_ts,
+            thread_messages=self._thread_messages(
+                client=client,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                fallback_event=payload,
+            ),
+            attachments=_event_attachments(payload, client=client, logger=self.logger),
         )
         try:
             if set_status is not None:
@@ -195,6 +237,7 @@ class SlackBridge:
         request: AgentRequest,
         channel_id: str,
         reply_thread_ts: str,
+        fallback_event: dict[str, Any],
     ) -> None:
         placeholder_ts: str | None = None
         try:
@@ -208,6 +251,11 @@ class SlackBridge:
             self.logger.exception("Failed to post Slack placeholder")
 
         try:
+            request = self._with_thread_context(
+                client=client,
+                request=request,
+                fallback_event=fallback_event,
+            )
             response_text = self.backend.send(request)
         except Exception as exc:
             self.logger.exception("Backend request failed")
@@ -240,6 +288,58 @@ class SlackBridge:
         thread = threading.Thread(target=target, daemon=True)
         thread.start()
 
+    def _with_thread_context(
+        self,
+        *,
+        client: WebClient,
+        request: AgentRequest,
+        fallback_event: dict[str, Any],
+    ) -> AgentRequest:
+        thread_messages = self._thread_messages(
+            client=client,
+            channel_id=request.channel_id,
+            thread_ts=request.thread_ts,
+            fallback_event=fallback_event,
+        )
+        attachments = _event_attachments(fallback_event, client=client, logger=self.logger)
+        return AgentRequest(
+            message=request.message,
+            session_id=request.session_id,
+            user_id=request.user_id,
+            channel_id=request.channel_id,
+            thread_ts=request.thread_ts,
+            thread_messages=thread_messages,
+            attachments=attachments,
+        )
+
+    def _thread_messages(
+        self,
+        *,
+        client: WebClient,
+        channel_id: str,
+        thread_ts: str,
+        fallback_event: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if not channel_id or not thread_ts:
+            return [_message_context(fallback_event, client=client, logger=self.logger)]
+        try:
+            response = client.conversations_replies(
+                channel=channel_id,
+                ts=thread_ts,
+                limit=MAX_THREAD_MESSAGES,
+                include_all_metadata=True,
+            )
+            messages = response.get("messages") or []
+            if isinstance(messages, list) and messages:
+                return [
+                    _message_context(message, client=client, logger=self.logger)
+                    for message in messages[-MAX_THREAD_MESSAGES:]
+                    if isinstance(message, dict)
+                ]
+        except Exception:
+            self.logger.exception("Could not fetch Slack thread history")
+        return [_message_context(fallback_event, client=client, logger=self.logger)]
+
 
 def _bot_user_id(client: WebClient) -> str:
     try:
@@ -254,6 +354,114 @@ def _strip_slack_mentions(text: str, bot_user_id: str) -> str:
     if bot_user_id:
         text = re.sub(rf"<@{re.escape(bot_user_id)}(?:\|[^>]+)?>", "", text)
     return re.sub(r"<@[A-Z0-9]+(?:\|[^>]+)?>", "", text)
+
+
+def _message_context(
+    message: dict[str, Any],
+    *,
+    client: WebClient,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    return {
+        "ts": str(message.get("ts") or ""),
+        "thread_ts": str(message.get("thread_ts") or ""),
+        "user_id": str(message.get("user") or ""),
+        "bot_id": str(message.get("bot_id") or ""),
+        "subtype": str(message.get("subtype") or ""),
+        "text": str(message.get("text") or ""),
+        "attachments": _event_attachments(message, client=client, logger=logger),
+    }
+
+
+def _event_attachments(
+    event: dict[str, Any],
+    *,
+    client: WebClient,
+    logger: logging.Logger,
+) -> list[dict[str, Any]]:
+    attachments: list[dict[str, Any]] = []
+    for file_info in event.get("files") or []:
+        if isinstance(file_info, dict):
+            attachments.append(_file_attachment(file_info, client=client, logger=logger))
+    for attachment in event.get("attachments") or []:
+        if isinstance(attachment, dict):
+            attachments.append(_slack_attachment(attachment))
+    return attachments
+
+
+def _file_attachment(
+    file_info: dict[str, Any],
+    *,
+    client: WebClient,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    attachment: dict[str, Any] = {
+        "type": "file",
+        "id": str(file_info.get("id") or ""),
+        "name": str(file_info.get("name") or ""),
+        "title": str(file_info.get("title") or ""),
+        "mimetype": str(file_info.get("mimetype") or ""),
+        "filetype": str(file_info.get("filetype") or ""),
+        "pretty_type": str(file_info.get("pretty_type") or ""),
+        "size": file_info.get("size"),
+        "url_private": str(file_info.get("url_private") or ""),
+        "url_private_download": str(file_info.get("url_private_download") or ""),
+        "permalink": str(file_info.get("permalink") or ""),
+    }
+    content = _download_text_file(file_info, client=client, logger=logger)
+    if content is not None:
+        attachment["content"] = content
+        attachment["content_truncated"] = len(content.encode("utf-8")) >= MAX_ATTACHMENT_BYTES
+    return attachment
+
+
+def _slack_attachment(attachment: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "attachment",
+        "title": str(attachment.get("title") or ""),
+        "text": str(attachment.get("text") or ""),
+        "fallback": str(attachment.get("fallback") or ""),
+        "service_name": str(attachment.get("service_name") or ""),
+        "from_url": str(attachment.get("from_url") or ""),
+        "original_url": str(attachment.get("original_url") or ""),
+    }
+
+
+def _download_text_file(
+    file_info: dict[str, Any],
+    *,
+    client: WebClient,
+    logger: logging.Logger,
+) -> str | None:
+    mimetype = str(file_info.get("mimetype") or "").lower()
+    filetype = str(file_info.get("filetype") or "").lower()
+    if not (mimetype.startswith("text/") or filetype in TEXT_FILETYPES):
+        return None
+
+    url = str(file_info.get("url_private_download") or file_info.get("url_private") or "")
+    token = getattr(client, "token", None)
+    if not url or not token:
+        return None
+
+    try:
+        response = httpx.get(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Range": f"bytes=0-{MAX_ATTACHMENT_BYTES - 1}"},
+            timeout=10,
+        )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in {401, 403}:
+            logger.warning("Could not download Slack file; missing files:read or file access")
+        else:
+            logger.exception("Could not download Slack file attachment")
+        return None
+    except Exception:
+        logger.exception("Could not download Slack file attachment")
+        return None
+
+    content = response.content[:MAX_ATTACHMENT_BYTES]
+    return content.decode(response.encoding or "utf-8", errors="replace")
 
 
 def _post_chunks(

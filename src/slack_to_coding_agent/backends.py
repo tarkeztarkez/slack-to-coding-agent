@@ -15,6 +15,8 @@ class AgentRequest:
     user_id: str
     channel_id: str
     thread_ts: str
+    thread_messages: list[dict[str, Any]]
+    attachments: list[dict[str, Any]]
 
 
 class AgentBackend(Protocol):
@@ -38,6 +40,8 @@ class HttpJsonBackend:
             "prompt": request.message,
             "session_id": request.session_id,
             "thread_id": request.session_id,
+            "thread_messages": request.thread_messages,
+            "attachments": request.attachments,
             "metadata": {
                 "source": "slack",
                 "user_id": request.user_id,

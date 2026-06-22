@@ -98,6 +98,22 @@ The built-in `http_json` backend sends a POST like this to `base_url + path`:
   "prompt": "user text",
   "session_id": "slack:C123:1710000000.000000",
   "thread_id": "slack:C123:1710000000.000000",
+  "thread_messages": [
+    {
+      "ts": "1710000000.000000",
+      "user_id": "U123",
+      "text": "previous thread message",
+      "attachments": []
+    }
+  ],
+  "attachments": [
+    {
+      "type": "file",
+      "name": "example.py",
+      "mimetype": "text/x-python",
+      "content": "print('hello')"
+    }
+  ],
   "metadata": {
     "source": "slack",
     "user_id": "U123",
@@ -106,5 +122,9 @@ The built-in `http_json` backend sends a POST like this to `base_url + path`:
   }
 }
 ```
+
+Thread history is fetched with `conversations.replies` when Slack permissions allow it. File
+attachments include metadata, and text-like Slack files include downloaded content up to 50 KB when
+the app has `files:read`.
 
 For JSON responses, it reads the first non-empty value from `response_json_paths` in the config. For non-JSON responses, it posts the response body as Slack text.

@@ -41,7 +41,7 @@ class Handler(BaseHTTPRequestHandler):
             if not prompt:
                 self._send_json(400, {"error": "missing message or prompt"})
                 return
-            response = self._run_codex(prompt)
+            response = self._run_codex(_build_codex_prompt(payload))
         except subprocess.TimeoutExpired:
             LOGGER.exception("Codex request timed out")
             self._send_json(504, {"error": "Codex request timed out"})
@@ -149,6 +149,91 @@ def main() -> None:
 
     LOGGER.info("Codex HTTP adapter listening on http://%s:%s", args.host, args.port)
     server.serve_forever()
+
+
+def _build_codex_prompt(payload: dict[str, Any]) -> str:
+    message = str(payload.get("message") or payload.get("prompt") or "").strip()
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    thread_messages = payload.get("thread_messages")
+    attachments = payload.get("attachments")
+
+    parts = [
+        "You are responding to a Slack request forwarded to a local coding agent.",
+        "Use the Slack thread history and attachments below as context.",
+        "",
+        "Current user message:",
+        message,
+    ]
+
+    if metadata:
+        parts.extend(["", "Slack metadata:", _format_dict(metadata)])
+
+    if isinstance(thread_messages, list) and thread_messages:
+        parts.extend(["", "Slack thread history:"])
+        for index, item in enumerate(thread_messages, start=1):
+            if isinstance(item, dict):
+                parts.append(_format_thread_message(index, item))
+
+    if isinstance(attachments, list) and attachments:
+        parts.extend(["", "Current message attachments:"])
+        for index, item in enumerate(attachments, start=1):
+            if isinstance(item, dict):
+                parts.append(_format_attachment(index, item))
+
+    return "\n".join(part for part in parts if part is not None).strip()
+
+
+def _format_thread_message(index: int, item: dict[str, Any]) -> str:
+    user = item.get("user_id") or item.get("bot_id") or "unknown"
+    ts = item.get("ts") or ""
+    text = str(item.get("text") or "").strip() or "(no text)"
+    lines = [f"[{index}] {user} at {ts}:", text]
+    attachments = item.get("attachments")
+    if isinstance(attachments, list) and attachments:
+        lines.append("Attachments:")
+        for attachment_index, attachment in enumerate(attachments, start=1):
+            if isinstance(attachment, dict):
+                lines.append(_format_attachment(attachment_index, attachment))
+    return "\n".join(lines)
+
+
+def _format_attachment(index: int, item: dict[str, Any]) -> str:
+    attachment_type = item.get("type") or "attachment"
+    title = item.get("title") or item.get("name") or "untitled"
+    lines = [f"- Attachment {index} ({attachment_type}): {title}"]
+    for key in (
+        "id",
+        "name",
+        "mimetype",
+        "filetype",
+        "pretty_type",
+        "size",
+        "permalink",
+        "url_private",
+        "url_private_download",
+        "service_name",
+        "from_url",
+        "original_url",
+        "fallback",
+        "text",
+    ):
+        value = item.get(key)
+        if value not in (None, ""):
+            lines.append(f"  {key}: {value}")
+    content = item.get("content")
+    if isinstance(content, str) and content:
+        lines.extend(["  content:", _indent(content.rstrip(), "    ")])
+        if item.get("content_truncated"):
+            lines.append("  content_truncated: true")
+    return "\n".join(lines)
+
+
+def _format_dict(data: dict[str, Any]) -> str:
+    return "\n".join(f"- {key}: {value}" for key, value in data.items())
+
+
+def _indent(text: str, prefix: str) -> str:
+    return "\n".join(prefix + line for line in text.splitlines())
 
 
 if __name__ == "__main__":
