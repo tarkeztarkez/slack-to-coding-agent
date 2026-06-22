@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 from .config import CONFIG_FILE, ensure_config_file, load_config
+from .service import install_service
 from .slack_app import run
 
 
@@ -21,6 +22,11 @@ def main() -> None:
         action="store_true",
         help="Create the default config file and exit",
     )
+    parser.add_argument(
+        "--install-service",
+        action="store_true",
+        help="Install and start a per-user autostart service, then exit",
+    )
     parser.add_argument("--log-level", default="INFO", help="Python logging level")
     args = parser.parse_args()
 
@@ -32,6 +38,12 @@ def main() -> None:
     if args.init_config:
         ensure_config_file(args.config)
         print(f"Config file ready: {args.config}")
+        return
+
+    if args.install_service:
+        ensure_config_file(args.config)
+        service_path = install_service(args.config, args.log_level)
+        print(f"Service installed and started: {service_path}")
         return
 
     config = load_config(args.config)

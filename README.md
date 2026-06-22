@@ -57,6 +57,21 @@ Then run:
 uv run slack-to-coding-agent
 ```
 
+### Install as an autostart service
+
+On Linux (systemd user service) or macOS (LaunchAgent), install and start the bot with:
+
+```bash
+uv run slack-to-coding-agent --install-service
+```
+
+The service runs the current Python environment with the selected config file and starts
+automatically on login. Pass `--config /path/to/config.yaml` or `--log-level DEBUG` with
+`--install-service` to bake those values into the service.
+
+Linux logs are written to `~/.slack-to-coding-agent/service.log`. macOS logs are written to
+`~/.slack-to-coding-agent/service.out.log` and `~/.slack-to-coding-agent/service.err.log`.
+
 ### Auto-starting a Codex backend
 
 This package includes a small HTTP adapter for Codex CLI. It exposes the `/api/chat` endpoint
