@@ -95,6 +95,18 @@ backends:
 Backend process output is written to `~/.slack-to-coding-agent/<backend-name>-backend.log` unless
 `startup_log_file` is set.
 
+To also show Slack requests in the Codex app message history, add
+`--record-codex-history` to the Codex server start command:
+
+```yaml
+start_command: "slack-to-coding-agent-codex-server --host 127.0.0.1 --port 1455 --codex-cwd /path/to/repo --record-codex-history"
+```
+
+By default this records just the Slack user message in `$CODEX_HOME/history.jsonl` or
+`~/.codex/history.jsonl`. Use `--codex-history-text prompt` to record the full expanded prompt sent
+to Codex, including Slack metadata, thread history, and attachments. Use `--codex-history-file` to
+write to a different Codex history file.
+
 ## Slack app creation
 
 1. Open <https://api.slack.com/apps>.

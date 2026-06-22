@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 import tempfile
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -19,6 +22,9 @@ class CodexHttpServer(ThreadingHTTPServer):
     approval_policy: str
     timeout_seconds: float
     extra_args: list[str]
+    record_codex_history: bool
+    codex_history_file: Path | None
+    codex_history_text: str
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -41,7 +47,9 @@ class Handler(BaseHTTPRequestHandler):
             if not prompt:
                 self._send_json(400, {"error": "missing message or prompt"})
                 return
-            response = self._run_codex(_build_codex_prompt(payload))
+            prompt = _build_codex_prompt(payload)
+            self._record_codex_history(payload, prompt)
+            response = self._run_codex(prompt)
         except subprocess.TimeoutExpired:
             LOGGER.exception("Codex request timed out")
             self._send_json(504, {"error": "Codex request timed out"})
@@ -107,6 +115,28 @@ class Handler(BaseHTTPRequestHandler):
 
         return final_message or completed.stdout.strip()
 
+    def _record_codex_history(self, payload: dict[str, Any], prompt: str) -> None:
+        if not self.server.record_codex_history:
+            return
+
+        text = prompt if self.server.codex_history_text == "prompt" else _history_message(payload)
+        text = text.strip()
+        if not text:
+            return
+
+        history_file = self.server.codex_history_file or _default_codex_history_file()
+        entry = {
+            "session_id": str(uuid.uuid4()),
+            "ts": int(time.time()),
+            "text": text,
+        }
+        try:
+            history_file.parent.mkdir(parents=True, exist_ok=True)
+            with history_file.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError:
+            LOGGER.exception("Could not append Codex history entry to %s", history_file)
+
     def _send_json(self, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -131,6 +161,23 @@ def main() -> None:
         default=[],
         help="Extra argument passed to 'codex exec' before the prompt marker; repeat as needed.",
     )
+    parser.add_argument(
+        "--record-codex-history",
+        action="store_true",
+        help="Append each Slack request to Codex prompt history so it appears in the Codex app history.",
+    )
+    parser.add_argument(
+        "--codex-history-file",
+        type=Path,
+        default=None,
+        help="Override the Codex history JSONL file used with --record-codex-history.",
+    )
+    parser.add_argument(
+        "--codex-history-text",
+        choices=("message", "prompt"),
+        default="message",
+        help="History text to store: the Slack message only, or the full expanded Codex prompt.",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -146,6 +193,11 @@ def main() -> None:
     server.approval_policy = args.approval_policy
     server.timeout_seconds = args.timeout_seconds
     server.extra_args = args.extra_arg
+    server.record_codex_history = args.record_codex_history
+    server.codex_history_file = (
+        args.codex_history_file.expanduser() if args.codex_history_file else None
+    )
+    server.codex_history_text = args.codex_history_text
 
     LOGGER.info("Codex HTTP adapter listening on http://%s:%s", args.host, args.port)
     server.serve_forever()
@@ -181,6 +233,18 @@ def _build_codex_prompt(payload: dict[str, Any]) -> str:
                 parts.append(_format_attachment(index, item))
 
     return "\n".join(part for part in parts if part is not None).strip()
+
+
+def _history_message(payload: dict[str, Any]) -> str:
+    return str(payload.get("message") or payload.get("prompt") or "")
+
+
+def _default_codex_history_file() -> Path:
+    codex_home = Path.home() / ".codex"
+    env_codex_home = os.environ.get("CODEX_HOME")
+    if env_codex_home:
+        codex_home = Path(env_codex_home).expanduser()
+    return codex_home / "history.jsonl"
 
 
 def _format_thread_message(index: int, item: dict[str, Any]) -> str:
