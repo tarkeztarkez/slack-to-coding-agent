@@ -3,6 +3,10 @@ display_information:
   description: Forward mentions and assistant/DM messages to a local coding-agent backend.
   background_color: "#2c2d30"
 features:
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
   bot_user:
     display_name: coding-agent
     always_online: true
@@ -29,7 +33,7 @@ settings:
       - assistant_thread_context_changed
       - message.im
   interactivity:
-    is_enabled: true
+    is_enabled: false
   org_deploy_enabled: false
   socket_mode_enabled: true
   token_rotation_enabled: false
