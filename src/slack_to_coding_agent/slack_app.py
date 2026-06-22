@@ -1,0 +1,241 @@
+from __future__ import annotations
+
+import logging
+import re
+import threading
+from collections.abc import Callable
+from typing import Any
+
+from slack_bolt import App
+from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_sdk import WebClient
+
+from .backends import AgentBackend, AgentRequest, create_backend
+from .config import AppConfig
+
+LOGGER = logging.getLogger(__name__)
+MAX_SLACK_CHUNK = 3500
+
+
+def run(config: AppConfig) -> None:
+    backend = create_backend(config.backend)
+    app = App(token=config.slack.bot_token)
+    bot_user_id = _bot_user_id(app.client)
+
+    bridge = SlackBridge(
+        config=config,
+        backend=backend,
+        bot_user_id=bot_user_id,
+        logger=LOGGER,
+    )
+
+    @app.event("app_mention")
+    def handle_app_mention(ack: Callable[[], None], event: dict[str, Any], client: WebClient):
+        ack()
+        bridge.handle_message_event(event=event, client=client, strip_bot_mention=True)
+
+    @app.event("message")
+    def handle_direct_message(ack: Callable[[], None], event: dict[str, Any], client: WebClient):
+        ack()
+        if event.get("channel_type") != "im":
+            return
+        bridge.handle_message_event(event=event, client=client, strip_bot_mention=True)
+
+    @app.event("assistant_thread_started")
+    def handle_assistant_thread_started(
+        ack: Callable[[], None], event: dict[str, Any], client: WebClient
+    ):
+        ack()
+        bridge.handle_assistant_thread_started(event=event, client=client)
+
+    LOGGER.info("Starting Slack socket-mode bridge with config %s", config.path)
+    SocketModeHandler(app, config.slack.app_token).start()
+
+
+class SlackBridge:
+    def __init__(
+        self,
+        config: AppConfig,
+        backend: AgentBackend,
+        bot_user_id: str,
+        logger: logging.Logger,
+    ):
+        self.config = config
+        self.backend = backend
+        self.bot_user_id = bot_user_id
+        self.logger = logger
+
+    def handle_message_event(
+        self,
+        event: dict[str, Any],
+        client: WebClient,
+        *,
+        strip_bot_mention: bool,
+    ) -> None:
+        user_id = str(event.get("user") or "")
+        if not self._is_allowed_user(user_id):
+            return
+        if self._is_from_bot(event, user_id):
+            return
+
+        channel_id = str(event.get("channel") or "")
+        thread_ts = str(event.get("thread_ts") or event.get("ts") or "")
+        event_ts = str(event.get("ts") or thread_ts)
+        text = str(event.get("text") or "").strip()
+        if strip_bot_mention:
+            text = _strip_slack_mentions(text, self.bot_user_id).strip()
+        if not text:
+            return
+
+        session_id = f"slack:{channel_id}:{thread_ts}"
+        request = AgentRequest(
+            message=text,
+            session_id=session_id,
+            user_id=user_id,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+        )
+
+        self._run_in_background(
+            lambda: self._process_request(
+                client=client,
+                request=request,
+                channel_id=channel_id,
+                reply_thread_ts=thread_ts or event_ts,
+            )
+        )
+
+    def handle_assistant_thread_started(self, event: dict[str, Any], client: WebClient) -> None:
+        user_id = str(event.get("user") or event.get("user_id") or "")
+        if not self._is_allowed_user(user_id):
+            return
+
+        assistant_thread = event.get("assistant_thread") or {}
+        channel_id = str(
+            event.get("channel")
+            or event.get("channel_id")
+            or assistant_thread.get("channel_id")
+            or ""
+        )
+        thread_ts = str(
+            event.get("thread_ts")
+            or assistant_thread.get("thread_ts")
+            or event.get("event_ts")
+            or ""
+        )
+        if not channel_id:
+            self.logger.debug("assistant_thread_started without channel: %s", event)
+            return
+
+        _post_chunks(
+            client=client,
+            channel_id=channel_id,
+            thread_ts=thread_ts or None,
+            text="Hi! Send me a coding task and I will forward it to your local coding agent.",
+        )
+
+    def _process_request(
+        self,
+        *,
+        client: WebClient,
+        request: AgentRequest,
+        channel_id: str,
+        reply_thread_ts: str,
+    ) -> None:
+        placeholder_ts: str | None = None
+        try:
+            placeholder = client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=reply_thread_ts,
+                text="Working on it…",
+            )
+            placeholder_ts = str(placeholder.get("ts") or "") or None
+        except Exception:
+            self.logger.exception("Failed to post Slack placeholder")
+
+        try:
+            response_text = self.backend.send(request)
+        except Exception as exc:
+            self.logger.exception("Backend request failed")
+            response_text = f"Backend request failed: {exc}"
+
+        if not response_text.strip():
+            response_text = "Backend returned an empty response."
+
+        _post_chunks(
+            client=client,
+            channel_id=channel_id,
+            thread_ts=reply_thread_ts,
+            text=response_text,
+            update_ts=placeholder_ts,
+        )
+
+    def _is_allowed_user(self, user_id: str) -> bool:
+        allowed_user_id = self.config.slack.allowed_user_id
+        return not allowed_user_id or user_id == allowed_user_id
+
+    def _is_from_bot(self, event: dict[str, Any], user_id: str) -> bool:
+        if event.get("bot_id"):
+            return True
+        if self.bot_user_id and user_id == self.bot_user_id:
+            return True
+        subtype = event.get("subtype")
+        return subtype not in (None, "")
+
+    def _run_in_background(self, target: Callable[[], None]) -> None:
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+
+
+def _bot_user_id(client: WebClient) -> str:
+    try:
+        auth = client.auth_test()
+    except Exception:
+        LOGGER.exception("Could not call Slack auth.test; continuing without bot user id")
+        return ""
+    return str(auth.get("user_id") or "")
+
+
+def _strip_slack_mentions(text: str, bot_user_id: str) -> str:
+    if bot_user_id:
+        text = re.sub(rf"<@{re.escape(bot_user_id)}(?:\|[^>]+)?>", "", text)
+    return re.sub(r"<@[A-Z0-9]+(?:\|[^>]+)?>", "", text)
+
+
+def _post_chunks(
+    *,
+    client: WebClient,
+    channel_id: str,
+    thread_ts: str | None,
+    text: str,
+    update_ts: str | None = None,
+) -> None:
+    chunks = _chunk_text(text, MAX_SLACK_CHUNK)
+    if not chunks:
+        chunks = ["(empty response)"]
+
+    first_chunk, *remaining = chunks
+    if update_ts:
+        client.chat_update(channel=channel_id, ts=update_ts, text=first_chunk)
+    else:
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=first_chunk)
+
+    for chunk in remaining:
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=chunk)
+
+
+def _chunk_text(text: str, limit: int) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n", 0, limit)
+        if split_at < limit // 2:
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
