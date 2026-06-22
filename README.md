@@ -150,8 +150,10 @@ The built-in `http_json` backend sends a POST like this to `base_url + path`:
 }
 ```
 
-Thread history is fetched with `conversations.replies` when Slack permissions allow it. File
-attachments include metadata, and text-like Slack files include downloaded content up to 50 KB when
-the app has `files:read`.
+Thread history is fetched with `conversations.replies` when Slack permissions allow it. For an
+unthreaded `@bot` mention in a channel, the bot also fetches recent channel history up to that
+mention so a message you are replying to in-channel is included as context. File attachments include
+metadata, and text-like Slack files include downloaded content up to 50 KB when the app has
+`files:read`.
 
 For JSON responses, it reads the first non-empty value from `response_json_paths` in the config. For non-JSON responses, it posts the response body as Slack text.

@@ -18,6 +18,7 @@ from .process import ensure_backend_started
 LOGGER = logging.getLogger(__name__)
 MAX_SLACK_CHUNK = 3500
 MAX_THREAD_MESSAGES = 40
+MAX_CHANNEL_CONTEXT_MESSAGES = 10
 MAX_ATTACHMENT_BYTES = 50_000
 TEXT_FILETYPES = {
     "c",
@@ -166,10 +167,7 @@ class SlackBridge:
     ) -> None:
         assistant_thread = payload.get("assistant_thread") or {}
         user_id = str(
-            payload.get("user")
-            or payload.get("user_id")
-            or assistant_thread.get("user_id")
-            or ""
+            payload.get("user") or payload.get("user_id") or assistant_thread.get("user_id") or ""
         )
         if not self._is_allowed_user(user_id):
             return
@@ -322,22 +320,77 @@ class SlackBridge:
     ) -> list[dict[str, Any]]:
         if not channel_id or not thread_ts:
             return [_message_context(fallback_event, client=client, logger=self.logger)]
+
+        event_ts = str(fallback_event.get("ts") or "")
+        is_thread_reply = bool(fallback_event.get("thread_ts"))
+        if not is_thread_reply and str(fallback_event.get("channel_type") or "") != "im":
+            return self._channel_context_messages(
+                client=client,
+                channel_id=channel_id,
+                latest_ts=event_ts or thread_ts,
+                fallback_event=fallback_event,
+            )
+
         try:
+            kwargs: dict[str, Any] = {}
+            if event_ts:
+                kwargs.update({"latest": event_ts, "inclusive": True})
             response = client.conversations_replies(
                 channel=channel_id,
                 ts=thread_ts,
                 limit=MAX_THREAD_MESSAGES,
                 include_all_metadata=True,
+                **kwargs,
             )
             messages = response.get("messages") or []
             if isinstance(messages, list) and messages:
-                return [
-                    _message_context(message, client=client, logger=self.logger)
-                    for message in messages[-MAX_THREAD_MESSAGES:]
-                    if isinstance(message, dict)
-                ]
+                return _ensure_fallback_message(
+                    [
+                        _message_context(message, client=client, logger=self.logger)
+                        for message in messages[-MAX_THREAD_MESSAGES:]
+                        if isinstance(message, dict)
+                    ],
+                    fallback_event=fallback_event,
+                    client=client,
+                    logger=self.logger,
+                )
         except Exception:
             self.logger.exception("Could not fetch Slack thread history")
+        return [_message_context(fallback_event, client=client, logger=self.logger)]
+
+    def _channel_context_messages(
+        self,
+        *,
+        client: WebClient,
+        channel_id: str,
+        latest_ts: str,
+        fallback_event: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        try:
+            kwargs: dict[str, Any] = {}
+            if latest_ts:
+                kwargs.update({"latest": latest_ts, "inclusive": True})
+            response = client.conversations_history(
+                channel=channel_id,
+                limit=MAX_CHANNEL_CONTEXT_MESSAGES,
+                include_all_metadata=True,
+                **kwargs,
+            )
+            messages = response.get("messages") or []
+            if isinstance(messages, list) and messages:
+                chronological_messages = list(reversed(messages[-MAX_CHANNEL_CONTEXT_MESSAGES:]))
+                return _ensure_fallback_message(
+                    [
+                        _message_context(message, client=client, logger=self.logger)
+                        for message in chronological_messages
+                        if isinstance(message, dict)
+                    ],
+                    fallback_event=fallback_event,
+                    client=client,
+                    logger=self.logger,
+                )
+        except Exception:
+            self.logger.exception("Could not fetch Slack channel history")
         return [_message_context(fallback_event, client=client, logger=self.logger)]
 
 
@@ -371,6 +424,20 @@ def _message_context(
         "text": str(message.get("text") or ""),
         "attachments": _event_attachments(message, client=client, logger=logger),
     }
+
+
+def _ensure_fallback_message(
+    messages: list[dict[str, Any]],
+    *,
+    fallback_event: dict[str, Any],
+    client: WebClient,
+    logger: logging.Logger,
+) -> list[dict[str, Any]]:
+    fallback = _message_context(fallback_event, client=client, logger=logger)
+    fallback_ts = fallback.get("ts")
+    if fallback_ts and any(message.get("ts") == fallback_ts for message in messages):
+        return messages
+    return [*messages, fallback]
 
 
 def _event_attachments(
@@ -446,7 +513,10 @@ def _download_text_file(
     try:
         response = httpx.get(
             url,
-            headers={"Authorization": f"Bearer {token}", "Range": f"bytes=0-{MAX_ATTACHMENT_BYTES - 1}"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Range": f"bytes=0-{MAX_ATTACHMENT_BYTES - 1}",
+            },
             timeout=10,
         )
         response.raise_for_status()
