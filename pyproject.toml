@@ -12,6 +12,7 @@ dependencies = [
 
 [project.scripts]
 slack-to-coding-agent = "slack_to_coding_agent.__main__:main"
+slack-to-coding-agent-codex-server = "slack_to_coding_agent.codex_server:main"
 
 [build-system]
 requires = ["hatchling"]

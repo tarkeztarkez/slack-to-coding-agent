@@ -12,12 +12,14 @@ from slack_sdk import WebClient
 
 from .backends import AgentBackend, AgentRequest, create_backend
 from .config import AppConfig
+from .process import ensure_backend_started
 
 LOGGER = logging.getLogger(__name__)
 MAX_SLACK_CHUNK = 3500
 
 
 def run(config: AppConfig) -> None:
+    ensure_backend_started(config.backend)
     backend = create_backend(config.backend)
     app = App(token=config.slack.bot_token)
     assistant = Assistant(app_name="slack-to-coding-agent", logger=LOGGER)

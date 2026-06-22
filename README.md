@@ -40,6 +40,13 @@ backends:
     path: "/api/chat"
     method: POST
     timeout_seconds: 300
+    # Optional: command to auto-start a local backend before connecting to Slack.
+    start_command: ""
+    startup_cwd: ""
+    startup_env: {}
+    startup_timeout_seconds: 30
+    health_url: ""
+    startup_log_file: ""
     token: ""
     headers: {}
 ```
@@ -49,6 +56,29 @@ Then run:
 ```bash
 uv run slack-to-coding-agent
 ```
+
+### Auto-starting a Codex backend
+
+This package includes a small HTTP adapter for Codex CLI. It exposes the `/api/chat` endpoint
+expected by the default `http_json` backend and runs `codex exec` for each Slack message.
+
+Example backend config:
+
+```yaml
+backends:
+  codex:
+    type: http_json
+    base_url: "http://127.0.0.1:1455"
+    path: "/api/chat"
+    method: POST
+    timeout_seconds: 300
+    start_command: "slack-to-coding-agent-codex-server --host 127.0.0.1 --port 1455 --codex-cwd /path/to/repo"
+    health_url: "http://127.0.0.1:1455/healthz"
+    startup_timeout_seconds: 30
+```
+
+Backend process output is written to `~/.slack-to-coding-agent/<backend-name>-backend.log` unless
+`startup_log_file` is set.
 
 ## Slack app creation
 

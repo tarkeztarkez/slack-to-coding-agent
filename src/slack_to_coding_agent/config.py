@@ -26,6 +26,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "path": "/api/chat",
             "method": "POST",
             "timeout_seconds": 300,
+            "start_command": "",
+            "startup_cwd": "",
+            "startup_env": {},
+            "startup_timeout_seconds": 30,
+            "health_url": "",
+            "startup_log_file": "",
             "token": "",  # Optional bearer token for a protected local backend.
             "headers": {},
             "response_json_paths": [
@@ -56,6 +62,12 @@ class BackendConfig:
     path: str
     method: str = "POST"
     timeout_seconds: float = 300
+    start_command: str = ""
+    startup_cwd: str = ""
+    startup_env: dict[str, str] = field(default_factory=dict)
+    startup_timeout_seconds: float = 30
+    health_url: str = ""
+    startup_log_file: str = ""
     token: str = ""
     headers: dict[str, str] = field(default_factory=dict)
     response_json_paths: list[str] = field(default_factory=list)
@@ -106,6 +118,12 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
         path="/" + str(backend_raw.get("path", "")).lstrip("/"),
         method=str(backend_raw.get("method", "POST")).upper(),
         timeout_seconds=float(backend_raw.get("timeout_seconds", 300)),
+        start_command=str(backend_raw.get("start_command", "")).strip(),
+        startup_cwd=str(backend_raw.get("startup_cwd", "")).strip(),
+        startup_env={str(k): str(v) for k, v in (backend_raw.get("startup_env") or {}).items()},
+        startup_timeout_seconds=float(backend_raw.get("startup_timeout_seconds", 30)),
+        health_url=str(backend_raw.get("health_url", "")).strip(),
+        startup_log_file=str(backend_raw.get("startup_log_file", "")).strip(),
         token=str(backend_raw.get("token", "")).strip(),
         headers={str(k): str(v) for k, v in (backend_raw.get("headers") or {}).items()},
         response_json_paths=[str(p) for p in backend_raw.get("response_json_paths", [])],
