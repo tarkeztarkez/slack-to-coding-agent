@@ -6,7 +6,7 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-from slack_bolt import App
+from slack_bolt import App, Assistant
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk import WebClient
 
@@ -20,6 +20,7 @@ MAX_SLACK_CHUNK = 3500
 def run(config: AppConfig) -> None:
     backend = create_backend(config.backend)
     app = App(token=config.slack.bot_token)
+    assistant = Assistant(app_name="slack-to-coding-agent", logger=LOGGER)
     bot_user_id = _bot_user_id(app.client)
 
     bridge = SlackBridge(
@@ -28,6 +29,28 @@ def run(config: AppConfig) -> None:
         bot_user_id=bot_user_id,
         logger=LOGGER,
     )
+
+    @assistant.thread_started
+    def assistant_thread_started(
+        payload: dict[str, Any],
+        say: Callable[..., Any],
+        set_suggested_prompts: Callable[..., Any] | None = None,
+    ):
+        bridge.handle_assistant_thread_started_payload(
+            payload=payload,
+            say=say,
+            set_suggested_prompts=set_suggested_prompts,
+        )
+
+    @assistant.user_message
+    def assistant_user_message(
+        payload: dict[str, Any],
+        say: Callable[..., Any],
+        set_status: Callable[..., Any] | None = None,
+    ):
+        bridge.handle_assistant_user_message(payload=payload, say=say, set_status=set_status)
+
+    app.use(assistant)
 
     @app.event("app_mention")
     def handle_app_mention(ack: Callable[[], None], event: dict[str, Any], client: WebClient):
@@ -40,17 +63,6 @@ def run(config: AppConfig) -> None:
         if event.get("channel_type") != "im":
             return
         bridge.handle_message_event(event=event, client=client, strip_bot_mention=True)
-
-    @app.event("assistant_thread_started")
-    def handle_assistant_thread_started(
-        ack: Callable[[], None], event: dict[str, Any], client: WebClient
-    ):
-        ack()
-        bridge.handle_assistant_thread_started(event=event, client=client)
-
-    @app.event("assistant_thread_context_changed")
-    def handle_assistant_thread_context_changed(ack: Callable[[], None]):
-        ack()
 
     LOGGER.info("Starting Slack socket-mode bridge with config %s", config.path)
     SocketModeHandler(app, config.slack.app_token).start()
@@ -109,39 +121,70 @@ class SlackBridge:
             )
         )
 
-    def handle_assistant_thread_started(self, event: dict[str, Any], client: WebClient) -> None:
-        assistant_thread = event.get("assistant_thread") or {}
+    def handle_assistant_thread_started_payload(
+        self,
+        *,
+        payload: dict[str, Any],
+        say: Callable[..., Any],
+        set_suggested_prompts: Callable[..., Any] | None,
+    ) -> None:
+        assistant_thread = payload.get("assistant_thread") or {}
         user_id = str(
-            event.get("user")
-            or event.get("user_id")
+            payload.get("user")
+            or payload.get("user_id")
             or assistant_thread.get("user_id")
             or ""
         )
         if not self._is_allowed_user(user_id):
             return
+        if set_suggested_prompts is not None:
+            set_suggested_prompts(
+                [
+                    {
+                        "title": "Ask the coding agent",
+                        "message": "Help me with the current coding task.",
+                    }
+                ]
+            )
+        say("Hi! Send me a coding task and I will forward it to your local coding agent.")
 
-        channel_id = str(
-            event.get("channel")
-            or event.get("channel_id")
-            or assistant_thread.get("channel_id")
-            or ""
-        )
-        thread_ts = str(
-            event.get("thread_ts")
-            or assistant_thread.get("thread_ts")
-            or event.get("event_ts")
-            or ""
-        )
-        if not channel_id:
-            self.logger.debug("assistant_thread_started without channel: %s", event)
+    def handle_assistant_user_message(
+        self,
+        *,
+        payload: dict[str, Any],
+        say: Callable[..., Any],
+        set_status: Callable[..., Any] | None,
+    ) -> None:
+        user_id = str(payload.get("user") or "")
+        if not self._is_allowed_user(user_id):
+            return
+        if self._is_from_bot(payload, user_id):
             return
 
-        _post_chunks(
-            client=client,
+        channel_id = str(payload.get("channel") or "")
+        thread_ts = str(payload.get("thread_ts") or payload.get("ts") or "")
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            return
+
+        request = AgentRequest(
+            message=text,
+            session_id=f"slack-assistant:{channel_id}:{thread_ts}",
+            user_id=user_id,
             channel_id=channel_id,
-            thread_ts=thread_ts or None,
-            text="Hi! Send me a coding task and I will forward it to your local coding agent.",
+            thread_ts=thread_ts,
         )
+        try:
+            if set_status is not None:
+                set_status("Working on it…")
+            response_text = self.backend.send(request)
+        except Exception as exc:
+            self.logger.exception("Backend request failed")
+            response_text = f"Backend request failed: {exc}"
+        if not response_text.strip():
+            response_text = "Backend returned an empty response."
+        for chunk in _chunk_text(response_text, MAX_SLACK_CHUNK):
+            say(chunk)
 
     def _process_request(
         self,
