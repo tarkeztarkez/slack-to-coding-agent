@@ -48,6 +48,10 @@ def run(config: AppConfig) -> None:
         ack()
         bridge.handle_assistant_thread_started(event=event, client=client)
 
+    @app.event("assistant_thread_context_changed")
+    def handle_assistant_thread_context_changed(ack: Callable[[], None]):
+        ack()
+
     LOGGER.info("Starting Slack socket-mode bridge with config %s", config.path)
     SocketModeHandler(app, config.slack.app_token).start()
 
@@ -106,11 +110,16 @@ class SlackBridge:
         )
 
     def handle_assistant_thread_started(self, event: dict[str, Any], client: WebClient) -> None:
-        user_id = str(event.get("user") or event.get("user_id") or "")
+        assistant_thread = event.get("assistant_thread") or {}
+        user_id = str(
+            event.get("user")
+            or event.get("user_id")
+            or assistant_thread.get("user_id")
+            or ""
+        )
         if not self._is_allowed_user(user_id):
             return
 
-        assistant_thread = event.get("assistant_thread") or {}
         channel_id = str(
             event.get("channel")
             or event.get("channel_id")

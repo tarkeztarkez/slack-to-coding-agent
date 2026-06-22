@@ -23,6 +23,7 @@ settings:
     bot_events:
       - app_mention
       - assistant_thread_started
+      - assistant_thread_context_changed
       - message.im
   interactivity:
     is_enabled: true
