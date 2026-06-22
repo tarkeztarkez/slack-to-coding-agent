@@ -68,21 +68,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def _run_codex(self, prompt: str) -> str:
         with tempfile.NamedTemporaryFile("r", encoding="utf-8") as output_file:
-            cmd = [
-                self.server.codex_bin,
-                "exec",
-                "--skip-git-repo-check",
-                "--sandbox",
-                self.server.sandbox,
-                "--ask-for-approval",
-                self.server.approval_policy,
-                "--color",
-                "never",
-                "--output-last-message",
-                output_file.name,
-                *self.server.extra_args,
-                "-",
-            ]
+            cmd = [self.server.codex_bin]
+            if self.server.approval_policy:
+                # Codex exposes approval policy as a top-level option, not as an `exec` option.
+                cmd.extend(["--ask-for-approval", self.server.approval_policy])
+            cmd.extend(
+                [
+                    "exec",
+                    "--skip-git-repo-check",
+                    "--sandbox",
+                    self.server.sandbox,
+                    "--color",
+                    "never",
+                    "--output-last-message",
+                    output_file.name,
+                    *self.server.extra_args,
+                    "-",
+                ]
+            )
             LOGGER.info("Running Codex command: %s", " ".join(cmd))
             completed = subprocess.run(
                 cmd,
